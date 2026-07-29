@@ -11,6 +11,10 @@ figma.ui.onmessage = async (msg) => {
     root.y = 0;
     root.resize(Math.max(tree.width, 1), Math.max(tree.height, 1));
     root.fills = parseFill(tree.backgroundColor);
+
+    // Prevents Figma from hiding out-of-bounds layers!
+    root.clipsContent = false;
+
     figma.currentPage.appendChild(root);
 
     await buildNode(tree, root, tree.x, tree.y);
@@ -22,56 +26,60 @@ figma.ui.onmessage = async (msg) => {
 
 async function buildNode(data, parent, originX, originY) {
   for (const child of data.children || []) {
-    const frame = figma.createFrame();
-    frame.name = child.tag;
+    if (!child || typeof child !== "object") continue;
 
-    // --- Fill: image takes priority over background color ---
-    if (child.imageData) {
-      try {
-        const bytes = base64ToUint8Array(child.imageData);
-        const image = figma.createImage(bytes);
-        frame.fills = [
-          { type: "IMAGE", scaleMode: "FILL", imageHash: image.hash },
-        ];
-      } catch (err) {
-        console.log(
-          "Image failed to load, falling back to background color:",
-          err,
-        );
+    try {
+      const frame = figma.createFrame();
+      frame.name = child.tag || "node";
+
+      // 1. Calculate the relative position correctly based on the immediate parent
+      const relativeX = child.x - originX;
+      const relativeY = child.y - originY;
+
+      if (child.imageData) {
+        try {
+          const bytes = base64ToUint8Array(child.imageData);
+          const image = figma.createImage(bytes);
+          frame.fills = [
+            { type: "IMAGE", scaleMode: "FILL", imageHash: image.hash },
+          ];
+        } catch (err) {
+          frame.fills = parseFill(child.backgroundColor);
+        }
+      } else {
         frame.fills = parseFill(child.backgroundColor);
       }
-    } else {
-      frame.fills = parseFill(child.backgroundColor);
-    }
 
-    // --- Layout: auto-layout for flex containers, manual position/size otherwise ---
-    if (child.display === "flex") {
-      applyAutoLayout(frame, child);
-    } else {
-      frame.x = child.x - originX;
-      frame.y = child.y - originY;
+      // 2. ALWAYS set coordinates and resize, even for flex containers
+      frame.x = relativeX;
+      frame.y = relativeY;
       frame.resize(Math.max(child.width, 1), Math.max(child.height, 1));
-    }
 
-    // --- Visual polish: corner radius, border/stroke, box-shadow ---
-    applyCornerRadius(frame, child.borderRadius);
-    applyStroke(frame, child);
-    applyShadow(frame, child.boxShadow);
+      if (child.display === "flex") {
+        applyAutoLayout(frame, child);
 
-    parent.appendChild(frame);
+        // Switch Figma from "Hug" to "Fixed" to respect the actual dimensions extracted from the browser
+        frame.primaryAxisSizingMode = "FIXED";
+        frame.counterAxisSizingMode = "FIXED";
 
-    // --- Text ---
-    if (child.text) {
-      await addText(child, frame);
-    }
+        // Also unclip inner flex frames just to be safe during import
+        frame.clipsContent = false;
+      }
 
-    // --- Recurse into children ---
-    await buildNode(child, frame, originX, originY);
+      applyCornerRadius(frame, child.borderRadius);
+      applyStroke(frame, child);
+      applyShadow(frame, child.boxShadow);
 
-    // --- Auto-layout frames need position set AFTER children are added ---
-    if (child.display === "flex") {
-      frame.x = child.x - originX;
-      frame.y = child.y - originY;
+      parent.appendChild(frame);
+
+      if (child.text) {
+        await addText(child, frame);
+      }
+
+      // 3. Pass the CURRENT child's absolute coordinates as the new origin for its children
+      await buildNode(child, frame, child.x, child.y);
+    } catch (err) {
+      console.log("Skipped a node due to error:", err, child.tag);
     }
   }
 }
@@ -114,9 +122,6 @@ function applyAutoLayout(frame, data) {
 
   const gapValue = parseFloat(data.gap);
   frame.itemSpacing = isNaN(gapValue) ? 0 : gapValue;
-
-  frame.primaryAxisSizingMode = "AUTO";
-  frame.counterAxisSizingMode = "AUTO";
 }
 
 function applyCornerRadius(frame, borderRadius) {
